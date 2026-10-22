@@ -7,6 +7,7 @@ import asyncio
 import logging
 import sys
 
+from maya_mcp_server import __version__
 from maya_mcp_server.server import (
     initialize_session_manager,
     mcp,
@@ -20,6 +21,7 @@ def parse_args() -> argparse.Namespace:
         description="MCP server for Autodesk Maya",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
+    parser.add_argument("--version", action="version", version=f"maya-mcp-server {__version__}")
 
     parser.add_argument(
         "--scan-interval",

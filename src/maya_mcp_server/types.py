@@ -2,7 +2,9 @@
 
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, TypedDict
+from typing import Any
+
+from typing_extensions import TypedDict
 
 
 # Port ranges
@@ -44,16 +46,15 @@ class ErrorInfo(TypedDict):
 
 
 class ExecutionResult(TypedDict):
-    """Result of remote code execution.
+    """Stable tool result; communication failures leave execution state unknown."""
 
-    Note: stdout/stderr are delivered via MCP Resource subscriptions,
-    not in this result. Subscribe to:
-    - maya://sessions/{host}:{port}/stdout
-    - maya://sessions/{host}:{port}/stderr
-    """
-
+    success: bool
     result: Any | None  # Captured result (None if ResultType.NONE)
     error: ErrorInfo | None  # Exception info if error occurred
+    stdout: str
+    stderr: str
+    truncated: bool
+    execution_state: str
 
 
 @dataclass
@@ -96,3 +97,6 @@ class CommandResponse:
 
     result: Any  # The result value (can be None)
     error: ErrorInfo | None  # Error info if command failed
+    stdout: str = ""
+    stderr: str = ""
+    truncated: bool = False

@@ -1,4 +1,5 @@
 import logging
+import os
 import socket
 from collections.abc import Iterator
 
@@ -8,6 +9,11 @@ from maya_mcp_server.types import MayaListeningPort
 
 
 logger = logging.getLogger(__name__)
+
+
+def _configured_ports(name: str, default: str) -> set[int]:
+    raw = os.environ.get(name, default)
+    return {int(item.strip()) for item in raw.replace(";", ",").split(",") if item.strip()}
 
 
 def get_maya_process() -> Iterator[psutil.Process]:
@@ -35,6 +41,10 @@ def get_maya_listening_ports() -> Iterator[MayaListeningPort]:
         MayaListeningPort dictionaries with port, address, and process_id
     """
     found_any_maya = False
+    # Only explicit Python bootstrap ports may receive code. In particular never
+    # probe the company MEL/plugin ports, even if they are in the allow list.
+    allowed = _configured_ports("MAYA_MCP_ALLOW_PORTS", "7002,7003,7004,7005,7006")
+    skipped = {4434, 4648, 4658} | _configured_ports("MAYA_MCP_SKIP_PORTS", "")
 
     for maya_proc in get_maya_process():
         found_any_maya = True
@@ -50,6 +60,8 @@ def get_maya_listening_ports() -> Iterator[MayaListeningPort]:
                     conn.status == "LISTEN"
                     and conn.type == socket.SOCK_STREAM
                     and conn.family == socket.AF_INET
+                    and conn.laddr.port in allowed
+                    and conn.laddr.port not in skipped
                 ):
                     yield MayaListeningPort(
                         port=conn.laddr.port,

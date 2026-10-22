@@ -130,7 +130,9 @@ class SessionManager:
                     f"Discovered Maya session at {client.key} (PID {port_info['process_id']})"
                 )
 
-    async def _probe_port(self, host: str, port: int) -> BaseMayaClient | None:
+    async def _probe_port(
+        self, host: str, port: int, *, raise_errors: bool = False
+    ) -> BaseMayaClient | None:
         """
         Probe a port to check if it's a Maya command port.
 
@@ -147,31 +149,44 @@ class SessionManager:
         try:
             await client.connect()
             new_client = await client.bootstrap(client_type=self.client_type.value)
-            await client.disconnect()
             return new_client
         except MayaConnectionError:
+            if raise_errors:
+                raise
             return None
         except Exception as e:
+            if raise_errors:
+                raise MayaConnectionError(f"Failed to bootstrap Maya at {host}:{port}: {e}") from e
             logger.debug(f"Error probing {host}:{port}: {e}")
+            return None
+        finally:
             try:
                 await client.disconnect()
             except Exception:
                 pass
-            return None
 
     async def _prune_dead_sessions(self) -> None:
         """Remove sessions that are no longer responding."""
         dead_keys = []
 
-        for key, client in self._sessions.items():
+        for key, client in list(self._sessions.items()):
+            if client.is_busy or client.awaiting_reconnect:
+                continue
             try:
                 if not await client.ping():
-                    dead_keys.append(key)
+                    if not client.is_busy and not client.awaiting_reconnect:
+                        dead_keys.append(key)
             except Exception:
-                dead_keys.append(key)
+                if not client.is_busy and not client.awaiting_reconnect:
+                    dead_keys.append(key)
 
         for session_key in dead_keys:
-            client = self._sessions.pop(session_key)
+            maybe_client = self._sessions.get(session_key)
+            # Executions can start while a previous client's ping is awaited.
+            if maybe_client is None or maybe_client.is_busy or maybe_client.awaiting_reconnect:
+                continue
+            client = maybe_client
+            self._sessions.pop(session_key)
             logger.info(f"Pruned dead session: {session_key}")
 
             # Remove from config mapping
@@ -202,6 +217,10 @@ class SessionManager:
 
         for key, client in list(self._sessions.items()):
             try:
+                # Listing is an explicit request and should make intentionally
+                # detached sessions usable/visible again, without replaying code.
+                if client.awaiting_reconnect:
+                    client = await self.get_client(key)
                 info = await client.session_info()
                 results.append(info)
             except Exception as e:
@@ -259,6 +278,13 @@ class SessionManager:
                 raise ValueError(f"Session {session_key} not found")
             client = maybe_client
 
+        # A timed-out request detaches its stream rather than consuming a late
+        # response on the next call. Reconnect only for this new explicit request;
+        # never replay the timed-out code.
+        if not client.is_connected:
+            await client.connect()
+            self._stream_capture_installed.discard(client.key)
+
         # Auto-install stream capture on first access
         if client.key not in self._stream_capture_installed:
             try:
@@ -293,13 +319,16 @@ class SessionManager:
         if key in self._sessions:
             return self._sessions[key]
 
-        client = MayaClient(host, port)
-        await client.connect()
-        await client.bootstrap()
+        existing_key = self._config_to_session.get(key)
+        if existing_key in self._sessions:
+            return self._sessions[existing_key]
 
-        self._sessions[key] = client
-        logger.info(f"Added session: {key}")
-
+        client = await self._probe_port(host, port, raise_errors=True)
+        if client is None:
+            raise MayaConnectionError(f"Failed to bootstrap Maya at {host}:{port}")
+        self._sessions[client.key] = client
+        self._config_to_session[key] = client.key
+        logger.info(f"Added session: {client.key} (configuration port {key})")
         return client
 
 

@@ -29,6 +29,8 @@ def mock_client() -> MagicMock:
     client.host = "127.0.0.1"
     client.port = 50000
     client.key = "127.0.0.1:50000"
+    client.is_busy = False
+    client.awaiting_reconnect = False
     client.ping = AsyncMock(return_value=True)
     client.session_info = AsyncMock(
         return_value=SessionInfo(
@@ -301,6 +303,8 @@ class TestPruneDeadSessions:
         """Test pruning removes sessions that don't respond to ping."""
         dead_client = MagicMock()
         dead_client.key = "127.0.0.1:50000"
+        dead_client.is_busy = False
+        dead_client.awaiting_reconnect = False
         dead_client.ping = AsyncMock(return_value=False)
         dead_client.disconnect = AsyncMock()
 
@@ -332,6 +336,8 @@ class TestPruneDeadSessions:
         """Test pruning clears stream capture tracking if session is dead."""
         dead_client = MagicMock()
         dead_client.key = "127.0.0.1:50000"
+        dead_client.is_busy = False
+        dead_client.awaiting_reconnect = False
         dead_client.ping = AsyncMock(return_value=False)
         dead_client.disconnect = AsyncMock()
 
@@ -347,6 +353,8 @@ class TestPruneDeadSessions:
         """Test pruning handles ping exceptions as dead sessions."""
         error_client = MagicMock()
         error_client.key = "127.0.0.1:50000"
+        error_client.is_busy = False
+        error_client.awaiting_reconnect = False
         error_client.ping = AsyncMock(side_effect=Exception("Connection lost"))
         error_client.disconnect = AsyncMock()
 
@@ -390,6 +398,7 @@ class TestListSessions:
     async def test_list_sessions_handles_error(self, session_manager: SessionManager) -> None:
         """Test list_sessions handles session_info errors."""
         error_client = MagicMock()
+        error_client.awaiting_reconnect = False
         error_client.key = "127.0.0.1:50000"
         error_client.session_info = AsyncMock(side_effect=Exception("Connection lost"))
 
@@ -529,21 +538,66 @@ class TestAddSession:
     """Test add_session method."""
 
     @pytest.mark.asyncio
+    async def test_explicit_add_session_preserves_bootstrap_stage_error(
+        self, session_manager, mocker
+    ):
+        bootstrap_client = MagicMock(spec=MayaClient)
+        bootstrap_client.connect = AsyncMock()
+        bootstrap_client.bootstrap = AsyncMock(
+            side_effect=MayaConnectionError(
+                "Maya bootstrap failed during install Maya helper: SyntaxError"
+            )
+        )
+        bootstrap_client.disconnect = AsyncMock()
+        mocker.patch("maya_mcp_server.session_manager.MayaClient", return_value=bootstrap_client)
+        with pytest.raises(MayaConnectionError, match="during install Maya helper: SyntaxError"):
+            await session_manager.add_session("127.0.0.1", 7002)
+        bootstrap_client.disconnect.assert_awaited_once()
+        assert session_manager.session_count == 0
+
+    @pytest.mark.asyncio
+    async def test_add_session_reuses_configuration_mapping(
+        self, session_manager: SessionManager, mock_client: MagicMock, mocker
+    ) -> None:
+        session_manager._sessions[mock_client.key] = mock_client
+        session_manager._config_to_session["127.0.0.1:7002"] = mock_client.key
+        probe = mocker.patch.object(session_manager, "_probe_port", new_callable=AsyncMock)
+        assert await session_manager.add_session("127.0.0.1", 7002) is mock_client
+        probe.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_get_client_reconnects_detached_stream_without_replaying(
+        self, session_manager: SessionManager, mock_client: MagicMock
+    ) -> None:
+        mock_client.is_connected = False
+        session_manager._sessions[mock_client.key] = mock_client
+        session_manager._stream_capture_installed.add(mock_client.key)
+        assert await session_manager.get_client(mock_client.key) is mock_client
+        mock_client.connect.assert_awaited_once()
+        mock_client.install_stream_capture.assert_awaited_once()
+        mock_client.bootstrap.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_add_session_new(self, session_manager: SessionManager, mocker) -> None:
         """Test adding a new session."""
         mock_maya_client = MagicMock(spec=MayaClient)
         mock_maya_client.connect = AsyncMock()
-        mock_maya_client.bootstrap = AsyncMock()
+        qt_client = MagicMock()
+        qt_client.key = "127.0.0.1:50002"
+        mock_maya_client.bootstrap = AsyncMock(return_value=qt_client)
+        mock_maya_client.disconnect = AsyncMock()
         mock_maya_client.key = "127.0.0.1:7001"
 
         mocker.patch("maya_mcp_server.session_manager.MayaClient", return_value=mock_maya_client)
 
         result = await session_manager.add_session("127.0.0.1", 7001)
 
-        assert result is mock_maya_client
-        assert "127.0.0.1:7001" in session_manager._sessions
+        assert result is qt_client
+        assert "127.0.0.1:50002" in session_manager._sessions
+        assert session_manager._config_to_session["127.0.0.1:7001"] == qt_client.key
         mock_maya_client.connect.assert_called_once()
-        mock_maya_client.bootstrap.assert_called_once()
+        mock_maya_client.bootstrap.assert_called_once_with(client_type="qt")
+        mock_maya_client.disconnect.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_add_session_existing(

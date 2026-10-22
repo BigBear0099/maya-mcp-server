@@ -258,6 +258,15 @@ class TestStreamCapture:
 class TestExecuteCode:
     """Test execute_code method."""
 
+    @pytest.fixture(autouse=True)
+    def buffered_output(self, maya_client: MayaClient, mocker):
+        return mocker.patch.object(
+            maya_client,
+            "get_buffered_output",
+            new_callable=AsyncMock,
+            return_value=OutputBuffer(),
+        )
+
     @pytest.mark.asyncio
     async def test_execute_code_none_result_type(self, maya_client: MayaClient, mocker) -> None:
         """Test execute_code with NONE result type."""
@@ -276,6 +285,7 @@ class TestExecuteCode:
             maya_client.EXECUTE_TEMPLATE,
             {"code": "print('hello')", "result_type": "NONE"},
             raise_on_error=False,
+            timeout=None,
         )
 
     @pytest.mark.asyncio
@@ -568,4 +578,5 @@ class TestMayaQtClientExecuteCode:
             qt_client.EXECUTE_TEMPLATE,
             {"code": "get_dict()", "result_type": "JSON"},
             raise_on_error=False,
+            timeout=None,
         )

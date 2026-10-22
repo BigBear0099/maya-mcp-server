@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "maya-mcp-server"
-version = "0.1.0"
+version = "0.2.0"
 description = "MCP server for interacting with Autodesk Maya sessions"
 readme = "README.md"
 license = "MIT"
@@ -21,8 +21,9 @@ classifiers = [
     "Topic :: Multimedia :: Graphics :: 3D Modeling",
 ]
 dependencies = [
-    "fastmcp>=2.0.0,<3.0.0",
+    "fastmcp>=2.14.7,<3.0.0",
     "psutil",
+    "typing-extensions>=4.0",
 ]
 
 [project.optional-dependencies]
@@ -43,9 +44,9 @@ dev = [
 maya-mcp-server = "maya_mcp_server.__main__:main"
 
 [project.urls]
-Homepage = "https://github.com/chadrik/maya-mcp-server"
-Repository = "https://github.com/chadrik/maya-mcp-server"
-Issues = "https://github.com/chadrik/maya-mcp-server/issues"
+Homepage = "https://github.com/BigBear0099/maya-mcp-server"
+Repository = "https://github.com/BigBear0099/maya-mcp-server"
+Issues = "https://github.com/BigBear0099/maya-mcp-server/issues"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/maya_mcp_server"]

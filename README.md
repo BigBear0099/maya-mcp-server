@@ -1,4 +1,77 @@
+---
+share: external
+---
+<!-- Privacy reviewed: examples use generic installation paths and contain no credentials. -->
+
 # maya-mcp-server
+
+## Maintained compatibility branch
+
+This fork of [chadrik/maya-mcp-server](https://github.com/chadrik/maya-mcp-server)
+maintains the `codex/maya-2022-2026-reliability` branch for **Maya 2022 / Python 3.7 /
+PySide2** and **Maya 2026 / Python 3.11 / PySide6**. The external MCP server requires
+Python 3.10+; its dependencies are never installed into Maya's interpreter.
+
+The maintained version is **0.2.0**. Installing `maya-mcp-server` from PyPI still
+selects the upstream package. Install this fork from an explicitly verified commit
+or build a wheel from the tested checkout:
+
+```sh
+python -m pip install "maya-mcp-server @ git+https://github.com/BigBear0099/maya-mcp-server.git@<verified-commit>"
+```
+
+The first maintenance release repairs Python 3.7 result capture using compiled AST,
+propagates remote exceptions, and returns this envelope in both MCP text and
+`structuredContent`:
+
+```json
+{"success":true,"result":null,"error":null,"stdout":"","stderr":"","truncated":false,"execution_state":"completed"}
+```
+
+`NONE` executes without capturing a result and always returns `null`. `RAW` returns
+the final expression's string representation. `JSON` preserves JSON value types.
+Remote failures set MCP `isError=true` and preserve exception type, message,
+traceback, and captured output. A communication timeout reports
+`execution_state="unknown"`: the Maya operation may have completed, so the server
+does **not** automatically replay it. `execute_code` accepts a positive finite
+`timeout` in seconds. This is a response deadline, not cancellation of Maya work.
+
+Qt execution and output capture use one atomic request. Each output stream is
+bounded to 1 MiB of UTF-8 data and sets `truncated` when clipped. Busy requests are
+protected from same-client heartbeat pruning, and timed-out connections are
+discarded so late replies cannot be consumed by later requests. Identical injected
+helpers are reused across clients. Same-scene mutations still require coordination.
+
+Automatic discovery only probes `7002,7003,7004,7005,7006` by default. Override with
+`MAYA_MCP_ALLOW_PORTS`; `0` disables discovery for explicit `add_session` use. MEL
+and plugin ports `4434,4648,4658` remain excluded. Only pass known Python command
+ports to `add_session`. Qt is the supported production transport; native commandPort
+is retained as a compatibility path with less reliable cross-client output capture.
+
+Validation commands:
+
+```sh
+python -m pytest -q
+mayapy scripts/check_injected_runtime.py
+python scripts/smoke_maya.py --bootstrap --version 2022
+python scripts/smoke_maya.py --bootstrap --version 2026
+```
+
+The GUI smoke driver uses a new process, unique `MAYA_APP_DIR`, an owned bootstrap
+port and the actual stdio/Qt transport. It checks scene changes, Unicode, all result
+modes, errors, shared-client output, and timeout recovery. Raw evidence stays in
+ignored `artifacts/` directories. CI covers host tests and Python 3.7 helper code;
+GUI tests require licensed local Maya installations.
+
+Patch references: upstream [exception PR #8](https://github.com/chadrik/maya-mcp-server/pull/8),
+[timeout PR #6](https://github.com/chadrik/maya-mcp-server/pull/6), and PheobeAI's
+[atomic output](https://github.com/PheobeAI/maya-mcp-server/commit/e7d2f2de6a9bd96b6585c41e2bafab7ecb2b00ad)
+and [Qt cleanup](https://github.com/PheobeAI/maya-mcp-server/commit/55daa3df28606f473409502d07c78593a37a5b7e)
+changes informed the maintenance implementation. Their permanent probe blacklist
+and four-second heartbeat pruning were not adopted. Upstream MIT attribution is
+preserved in `LICENSE`.
+
+## Upstream overview
 
 MCP server for interacting with Autodesk Maya sessions.
 

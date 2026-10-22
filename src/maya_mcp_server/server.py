@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
+import json
 import logging
-from typing import Any
+import traceback
 
 from fastmcp import FastMCP
+from fastmcp.tools.tool import ToolResult
+from mcp.types import CallToolResult, TextContent
 
+from maya_mcp_server.client import MayaConnectionError, MayaExecutionError
 from maya_mcp_server.session_manager import SessionManager
-from maya_mcp_server.types import ClientType, OutputBuffer, ResultType, SessionInfo
+from maya_mcp_server.types import ClientType, ExecutionResult, OutputBuffer, ResultType, SessionInfo
 
 
 logger = logging.getLogger(__name__)
@@ -20,6 +24,24 @@ mcp = FastMCP(
 
 # Global session manager - initialized when server starts
 _session_manager: SessionManager | None = None
+
+
+class ExecutionToolResult(ToolResult):
+    """Keep the same JSON envelope in text and structured MCP results, including errors."""
+
+    def __init__(self, payload: ExecutionResult) -> None:
+        super().__init__(
+            content=[TextContent(type="text", text=json.dumps(payload, ensure_ascii=False))],
+            structured_content=payload,
+        )
+        self.is_error = not payload["success"]
+
+    def to_mcp_result(self) -> CallToolResult:
+        return CallToolResult(
+            content=self.content,
+            structuredContent=self.structured_content,
+            isError=self.is_error,
+        )
 
 
 def get_session_manager() -> SessionManager:
@@ -99,7 +121,8 @@ async def execute_code(
     code: str,
     result_type: str = "NONE",
     session_key: str | None = None,
-) -> Any:
+    timeout: float | None = None,
+) -> ToolResult:
     """
     Execute Python code in a Maya session.
 
@@ -110,13 +133,16 @@ async def execute_code(
             - "JSON": Evaluate expression, JSON encode result
             - "RAW": Evaluate expression, return string representation
         session_key: Session key (optional if only one session exists)
+        timeout: Positive finite response deadline in seconds; not cancellation of Maya work.
 
     Returns:
-        Captured result (None if result_type is NONE)
+        A stable success/result/error/stdout/stderr/truncated/execution_state envelope.
+        NONE always returns null, JSON preserves JSON types, RAW returns a string.
+        Remote Python errors set MCP isError and include their traceback.
+        Communication failures have execution_state="unknown": do not replay blindly.
 
-    Note: stdout and stderr are delivered in real-time via MCP Resource
-    subscriptions (maya://sessions/{session_key}/stdout and /stderr).
-    Call get_output() to retrieve buffered output.
+    stdout and stderr are returned with this call. The session output resource
+    can also be polled for accumulated output; there is no get_output tool.
 
     Example:
         # Execute statements
@@ -125,20 +151,55 @@ async def execute_code(
         # Get JSON result
         execute_code("cmds.ls(type='mesh')", result_type="JSON")
     """
-    manager = get_session_manager()
-    client = await manager.get_client(session_key)
-
-    rt = ResultType(result_type)
-    result = await client.execute_code(code, rt)
-
-    # Fetch any buffered output and store it in the client
     try:
-        output = await client.get_buffered_output()
-        client.append_output(output.stdout, output.stderr)
-    except Exception as e:
-        logger.debug(f"Failed to get buffered output: {e}")
+        rt = ResultType(result_type)
+        manager = get_session_manager()
+        client = await manager.get_client(session_key)
+        response = await client.execute_code(code, rt, timeout=timeout)
+    except (MayaConnectionError, MayaExecutionError) as exc:
+        return ExecutionToolResult(
+            ExecutionResult(
+                success=False,
+                result=None,
+                error={
+                    "type": type(exc).__name__,
+                    "message": str(exc),
+                    "traceback": traceback.format_exc(),
+                },
+                stdout="",
+                stderr="",
+                truncated=False,
+                execution_state="unknown",
+            )
+        )
+    except ValueError as exc:
+        return ExecutionToolResult(
+            ExecutionResult(
+                success=False,
+                result=None,
+                error={
+                    "type": type(exc).__name__,
+                    "message": str(exc),
+                    "traceback": traceback.format_exc(),
+                },
+                stdout="",
+                stderr="",
+                truncated=False,
+                execution_state="not_started",
+            )
+        )
 
-    return result.result
+    return ExecutionToolResult(
+        ExecutionResult(
+            success=response.error is None,
+            result=response.result,
+            error=response.error,
+            stdout=response.stdout,
+            stderr=response.stderr,
+            truncated=response.truncated,
+            execution_state="failed" if response.error else "completed",
+        )
+    )
 
 
 @mcp.tool
@@ -207,9 +268,8 @@ async def session_output(session_key: str, clear: bool = True) -> OutputBuffer:
         OutputBuffer with stdout and stderr fields containing captured output
         since the last call (or since stream capture was installed).
 
-    This provides access to stdout/stderr that was captured during
-    execute_code calls. For real-time streaming, subscribe to the
-    MCP Resources instead.
+    This provides accumulated stdout/stderr from execute_code calls. Poll this
+    resource when needed; this server does not push real-time output notifications.
     """
     manager = get_session_manager()
     client = await manager.get_client(session_key)

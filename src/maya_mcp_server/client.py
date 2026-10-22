@@ -3,9 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import hashlib
 import json
 import logging
+import math
 import random
+import uuid
+import zlib
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, ClassVar, Literal
@@ -45,6 +50,10 @@ class MayaExecutionError(Exception):
     pass
 
 
+MAX_RESPONSE_BYTES = 16 * 1024 * 1024
+MAX_ACCUMULATED_BYTES = 256 * 1024
+
+
 @dataclass
 class BaseMayaClient(ABC):
     """Abstract base class for Maya clients."""
@@ -55,6 +64,7 @@ class BaseMayaClient(ABC):
     INSTALL_STREAM_CAPTURE: ClassVar[str]
     UNINSTALL_STREAM_CAPTURE: ClassVar[str]
     GET_BUFFERED_OUTPUT: ClassVar[str]
+    ATOMIC_EXECUTION: ClassVar[bool] = False
 
     host: str = "127.0.0.1"
     port: int = 7001
@@ -74,6 +84,12 @@ class BaseMayaClient(ABC):
         self._reader: asyncio.StreamReader | None = None
         self._writer: asyncio.StreamWriter | None = None
         self._lock = asyncio.Lock()
+        self._connection_lock = asyncio.Lock()
+        self._execution_lock = asyncio.Lock()
+        self._active_executions = 0
+        self._awaiting_reconnect = False
+        self._last_output_truncated = False
+        self._native_buffer = bytearray()
         # Output buffers for stdout/stderr capture
         self._stdout_buffer: str = ""
         self._stderr_buffer: str = ""
@@ -88,6 +104,36 @@ class BaseMayaClient(ABC):
         """Check if client is connected."""
         return self._writer is not None and not self._writer.is_closing()
 
+    @property
+    def is_busy(self) -> bool:
+        """Include queued executions and other requests that own the wire."""
+        return self._active_executions > 0 or self._lock.locked() or self._connection_lock.locked()
+
+    @property
+    def awaiting_reconnect(self) -> bool:
+        """An ambiguous timeout/cancel detached this stream intentionally."""
+        return self._awaiting_reconnect
+
+    def _effective_timeout(self, timeout: float | None) -> float:
+        value = self.timeout if timeout is None else timeout
+        if not math.isfinite(value) or value <= 0:
+            raise ValueError("timeout must be a finite positive number of seconds")
+        return value
+
+    def _discard_connection(self, *, recoverable: bool = False) -> asyncio.StreamWriter | None:
+        """Detach a poisoned stream before another request can use it."""
+        writer = self._writer
+        self._writer = None
+        self._reader = None
+        self._native_buffer.clear()
+        self._awaiting_reconnect = recoverable
+        if writer is not None:
+            try:
+                writer.close()
+            except Exception:
+                pass
+        return writer
+
     async def connect(self) -> None:
         """
         Establish connection to Maya command port.
@@ -95,32 +141,36 @@ class BaseMayaClient(ABC):
         Raises:
             MayaConnectionError: If connection fails
         """
-        try:
-            self._reader, self._writer = await asyncio.wait_for(
-                asyncio.open_connection(self.host, self.port),
-                timeout=self.timeout,
-            )
-            logger.info(f"Connected to Maya at {self.host}:{self.port}")
-        except asyncio.TimeoutError as e:
-            raise MayaConnectionError(
-                f"Timeout connecting to Maya at {self.host}:{self.port}"
-            ) from e
-        except OSError as e:
-            raise MayaConnectionError(
-                f"Failed to connect to Maya at {self.host}:{self.port}: {e}"
-            ) from e
+        async with self._connection_lock:
+            if self.is_connected:
+                self._awaiting_reconnect = False
+                return
+            try:
+                self._reader, self._writer = await asyncio.wait_for(
+                    asyncio.open_connection(self.host, self.port),
+                    timeout=self.timeout,
+                )
+                self._awaiting_reconnect = False
+                logger.info(f"Connected to Maya at {self.host}:{self.port}")
+            except asyncio.TimeoutError as e:
+                raise MayaConnectionError(
+                    f"Timeout connecting to Maya at {self.host}:{self.port}"
+                ) from e
+            except OSError as e:
+                self._awaiting_reconnect = False
+                raise MayaConnectionError(
+                    f"Failed to connect to Maya at {self.host}:{self.port}: {e}"
+                ) from e
 
     async def disconnect(self) -> None:
         """Close connection to Maya."""
         # FIXME: shut down the maya command port running in Maya
-        if self._writer:
-            self._writer.close()
+        writer = self._discard_connection()
+        if writer is not None:
             try:
-                await self._writer.wait_closed()
+                await asyncio.wait_for(writer.wait_closed(), timeout=1.0)
             except Exception:
                 pass
-            self._writer = None
-            self._reader = None
 
     async def __aenter__(self) -> Self:
         """Async context manager entry."""
@@ -141,10 +191,17 @@ class BaseMayaClient(ABC):
             stdout: Stdout content to append
             stderr: Stderr content to append
         """
-        if stdout:
-            self._stdout_buffer += stdout
-        if stderr:
-            self._stderr_buffer += stderr
+        self._stdout_buffer = self._append_capped(self._stdout_buffer, stdout)
+        self._stderr_buffer = self._append_capped(self._stderr_buffer, stderr)
+
+    @staticmethod
+    def _append_capped(existing: str, new: str) -> str:
+        combined = (existing + new).encode("utf-8")
+        if len(combined) <= MAX_ACCUMULATED_BYTES:
+            return combined.decode("utf-8")
+        marker = "[earlier accumulated output truncated]\n"
+        keep = MAX_ACCUMULATED_BYTES - len(marker.encode("utf-8"))
+        return marker + combined[-keep:].decode("utf-8", errors="ignore")
 
     def get_accumulated_output(self, clear: bool = True) -> OutputBuffer:
         """
@@ -186,15 +243,19 @@ class BaseMayaClient(ABC):
         await self._send_receive(self.UNINSTALL_STREAM_CAPTURE)
         logger.debug(f"Stream capture uninstalled for {self.host}:{self.port}")
 
-    async def get_buffered_output(self) -> OutputBuffer:
+    async def get_buffered_output(self, timeout: float | None = None) -> OutputBuffer:
         """
         Get buffered stdout/stderr content and clear the buffers.
 
         Returns:
             OutputBuffer with stdout and stderr fields containing captured output.
         """
-        response = await self._send_receive(self.GET_BUFFERED_OUTPUT)
+        if timeout is None:
+            response = await self._send_receive(self.GET_BUFFERED_OUTPUT)
+        else:
+            response = await self._send_receive(self.GET_BUFFERED_OUTPUT, timeout=timeout)
         result = response.result if response.result is not None else {}
+        self._last_output_truncated = bool(result.get("truncated", False))
         return OutputBuffer(
             stdout=result.get("stdout", ""),
             stderr=result.get("stderr", ""),
@@ -225,6 +286,7 @@ class BaseMayaClient(ABC):
         self,
         code: str,
         result_type: ResultType = ResultType.NONE,
+        timeout: float | None = None,
     ) -> CommandResponse:
         """
         Execute Python code in Maya and return the result.
@@ -238,32 +300,53 @@ class BaseMayaClient(ABC):
 
         Returns:
             CommandResponse with result and error info.
-            Note: stdout/stderr are delivered via MCP Resources, not returned here.
+            Includes stdout/stderr for this execution. A timeout does not cancel
+            code already running inside Maya and must never trigger replay.
         """
-        # Use Qt server JSON protocol
-        # Don't raise on execution errors - return them in the result
-        response = await self._send_receive(
-            self.EXECUTE_TEMPLATE,
-            {"code": code, "result_type": result_type.value},
-            raise_on_error=False,
-        )
+        effective_timeout = self._effective_timeout(timeout)
+        self._active_executions += 1
+        try:
+            # Native execution and output retrieval must not interleave on this
+            # client. Qt collects both inside a single Maya-side dispatch.
+            async with self._execution_lock:
+                deadline = asyncio.get_running_loop().time() + effective_timeout
+                response = await self._send_receive(
+                    self.EXECUTE_TEMPLATE,
+                    {"code": code, "result_type": result_type.value},
+                    raise_on_error=False,
+                    timeout=timeout,
+                )
+                if not self.ATOMIC_EXECUTION:
+                    remaining = deadline - asyncio.get_running_loop().time()
+                    if remaining <= 0:
+                        self._discard_connection(recoverable=True)
+                        raise MayaExecutionError(
+                            "Timeout collecting Maya output; code may have run"
+                        )
+                    output = await self.get_buffered_output(timeout=remaining)
+                    response.stdout = output.stdout
+                    response.stderr = output.stderr
+                    response.truncated = response.truncated or self._last_output_truncated
 
-        # Decode JSON result if needed (same as commandPort path)
-        if result_type == ResultType.JSON and response.result is not None:
-            try:
-                decoded_result = json.loads(response.result)
-                # Create new CommandResponse with decoded result
-                return CommandResponse(result=decoded_result, error=response.error)
-            except json.JSONDecodeError:
-                pass  # Keep as string if not valid JSON
-
-        return response
+                if result_type == ResultType.JSON and isinstance(response.result, str):
+                    try:
+                        response.result = json.loads(response.result)
+                    except json.JSONDecodeError:
+                        pass
+                self.append_output(response.stdout, response.stderr)
+                return response
+        finally:
+            self._active_executions -= 1
 
     # Abstract methods that must be implemented by subclasses
 
     @abstractmethod
     async def _send_receive(
-        self, method: str, params: dict[str, Any] | None = None, raise_on_error: bool = True
+        self,
+        method: str,
+        params: dict[str, Any] | None = None,
+        raise_on_error: bool = True,
+        timeout: float | None = None,
     ) -> CommandResponse:
         """
         Send command to Maya and receive response.
@@ -271,7 +354,7 @@ class BaseMayaClient(ABC):
         Args:
             method: Command string or method name (may contain {param} placeholders)
             params: Parameters to format into the command or pass to the method
-            raise_on_error: If True, raise exception on error. If False, return full response with error.
+            raise_on_error: Raise on remote errors when True; otherwise return the full response.
 
         Returns:
             CommandResponse with result and error attributes
@@ -321,7 +404,11 @@ class MayaClient(BaseMayaClient):
         self._port_type: PortType = PortType.UNKNOWN
 
     async def _send_receive(
-        self, method: str, params: dict[str, Any] | None = None, raise_on_error: bool = True
+        self,
+        method: str,
+        params: dict[str, Any] | None = None,
+        raise_on_error: bool = True,
+        timeout: float | None = None,
     ) -> CommandResponse:
         """
         Send command to Maya commandPort and receive response.
@@ -329,7 +416,7 @@ class MayaClient(BaseMayaClient):
         Args:
             method: Command template string (may contain {param} placeholders)
             params: Parameters to format into the template
-            raise_on_error: If True, raise exception on error. If False, return full response with error.
+            raise_on_error: Raise on remote errors when True; otherwise return the full response.
 
         Returns:
             CommandResponse with result and error attributes
@@ -338,8 +425,7 @@ class MayaClient(BaseMayaClient):
             MayaConnectionError: If not connected
             MayaExecutionError: If communication fails or raise_on_error is True and command errors
         """
-        if not self._writer or not self._reader:
-            raise MayaConnectionError("Not connected to Maya")
+        effective_timeout = self._effective_timeout(timeout)
 
         # Format the command template with params
         if params:
@@ -348,56 +434,86 @@ class MayaClient(BaseMayaClient):
             command = method
 
         async with self._lock:
-            try:
-                # Send command
-                self._writer.write(command.encode("utf-8"))
-                await self._writer.drain()
+            if not self._writer or not self._reader:
+                raise MayaConnectionError("Not connected to Maya")
+            reader, writer = self._reader, self._writer
 
-                # Read response until null terminator
-                response_bytes = b""
+            async def exchange() -> bytes:
+                # commandPort is line oriented; terminate every request.
+                writer.write(command.encode("utf-8").rstrip(b"\n") + b"\n")
+                await writer.drain()
                 while True:
-                    chunk = await asyncio.wait_for(
-                        self._reader.read(self.buffer_size),
-                        timeout=self.timeout,
-                    )
+                    separator = self._native_buffer.find(b"\x00")
+                    if separator >= 0:
+                        frame = bytes(self._native_buffer[:separator])
+                        del self._native_buffer[: separator + 1]
+                        if len(frame) > MAX_RESPONSE_BYTES:
+                            raise MayaExecutionError("Maya response exceeds 16 MiB limit")
+                        # Ignore an initial/extra empty acknowledgement, keeping
+                        # every complete nonempty frame separate.
+                        if frame.strip():
+                            return frame
+                        continue
+                    if len(self._native_buffer) > MAX_RESPONSE_BYTES:
+                        raise MayaExecutionError("Maya response exceeds 16 MiB limit")
+                    chunk = await reader.read(self.buffer_size)
                     if not chunk:
-                        break
-                    response_bytes += chunk
-                    # Maya terminates responses with \n\x00
-                    if response_bytes.endswith(b"\x00"):
-                        break
-
-                # Decode and strip terminator
-                response_str = response_bytes.decode("utf-8").rstrip("\x00").rstrip("\n")
-
-                # Parse JSON response if the command returns JSON
-                # Most helper functions return JSON with {"result": ..., "error": ...}
-                try:
-                    response = json.loads(response_str)
-                    # Check if it's a structured response
-                    if isinstance(response, dict) and ("result" in response or "error" in response):
-                        if raise_on_error and response.get("error"):
-                            error = response["error"]
-                            if isinstance(error, dict):
-                                raise MayaExecutionError(f"{error.get('message', 'Unknown error')}")
-                            else:
-                                raise MayaExecutionError(str(error))
-                        return CommandResponse(
-                            result=response.get("result"), error=response.get("error")
+                        raise MayaConnectionError(
+                            "Connection closed before Maya response terminator"
                         )
-                    else:
-                        # It's JSON but not our structured format, treat as raw result
-                        return CommandResponse(result=response, error=None)
-                except json.JSONDecodeError:
-                    # Not JSON, treat as raw string result
-                    return CommandResponse(result=response_str, error=None)
+                    self._native_buffer.extend(chunk)
 
-            except asyncio.TimeoutError as e:
-                raise MayaExecutionError("Timeout waiting for Maya response") from e
-            except MayaExecutionError:
+            try:
+                # One timeout budget covers drain and every response chunk.
+                response_bytes = await asyncio.wait_for(exchange(), timeout=effective_timeout)
+                response_str = response_bytes.decode("utf-8").rstrip("\x00").rstrip("\n")
+            except asyncio.CancelledError:
+                self._discard_connection(recoverable=True)
                 raise
+            except asyncio.TimeoutError as e:
+                self._discard_connection(recoverable=True)
+                raise MayaExecutionError(
+                    "Timeout waiting for Maya response; code may still be running"
+                ) from e
             except Exception as e:
+                self._discard_connection()
+                if isinstance(e, (MayaConnectionError, MayaExecutionError)):
+                    raise
                 raise MayaExecutionError(f"Error communicating with Maya: {e}") from e
+
+            # The complete frame is consumed before surfacing execution errors;
+            # those errors do not poison an otherwise healthy connection.
+            try:
+                response = json.loads(response_str)
+            except json.JSONDecodeError:
+                return CommandResponse(result=response_str, error=None)
+
+            # Some commandPort versions quote helper JSON one additional time.
+            # Only unwrap a nested object, preserving ordinary RAW strings.
+            if isinstance(response, str):
+                try:
+                    nested = json.loads(response)
+                except json.JSONDecodeError:
+                    pass
+                else:
+                    if isinstance(nested, dict):
+                        response = nested
+
+            if isinstance(response, dict) and ("result" in response or "error" in response):
+                if raise_on_error and response.get("error"):
+                    error = response["error"]
+                    message = (
+                        error.get("message", "Unknown error") if isinstance(error, dict) else error
+                    )
+                    raise MayaExecutionError(str(message))
+                return CommandResponse(
+                    result=response.get("result"),
+                    error=response.get("error"),
+                    stdout=response.get("stdout", ""),
+                    stderr=response.get("stderr", ""),
+                    truncated=bool(response.get("truncated", False)),
+                )
+            return CommandResponse(result=response, error=None)
 
     async def _detect_port_type(self) -> PortType:
         """
@@ -442,38 +558,90 @@ class MayaClient(BaseMayaClient):
                 f"Cannot bootstrap non-Python port (detected: {port_type.value})"
             )
 
-        if not overwrite:
-            # Check if already bootstrapped (e.g., from previous connection)
-            check_result = await self._send_receive(self.CHECK_BOOTSTRAP)
-            if (
-                str(check_result.result if check_result.result is not None else "").strip()
-                == "True"
-            ):
-                logger.info("Maya session already bootstrapped, updating module...")
-                # Module exists, but update it to ensure it has latest functions
-                helper_code = get_helper_module_code()
-                await self._send_receive(
-                    self.CREATE_MODULE_TEMPLATE,
-                    {"name": "maya_mcp", "code": helper_code, "overwrite": True},
-                )
-                logger.info("Maya mcp module updated")
-                return
+        # Native commandPort treats a short TCP recv as a complete command.
+        # Transfer compressed ASCII in small acknowledged requests, avoiding a
+        # multi-kilobyte repr(source) and any shared filesystem assumptions.
+        transfer_name = "__maya_mcp_transfer_" + uuid.uuid4().hex
+        transfer = f"__import__('sys').modules[{transfer_name!r}]"
+        stage = "initialize source transfer"
+        installed = False
 
-        # Execute bootstrap code using exec() with globals() to persist definitions
-        # Maya command port runs each command in isolated scope, so we must use
-        # exec(..., globals()) to make the code affect the global namespace
-        bootstrap_code = get_bootstrap_code()
-        bootstrap_cmd = f"exec({bootstrap_code!r}, globals())"
-        await self._send_receive(bootstrap_cmd)
-        # We've now bootstrapped the create_module function, which we use to create
-        # the helper module:
-        helper_code = get_helper_module_code()
-        # Remove the module name prefix since create_module doesn't exist yet
-        cmd = "create_module({name!r}, {code!r}, {overwrite!r})"
-        await self._send_receive(
-            cmd, {"name": "maya_mcp", "code": helper_code, "overwrite": overwrite}
-        )
-        logger.info("Maya session bootstrapped")
+        async def send(command: str) -> CommandResponse:
+            if not command.isascii() or len(command.encode("ascii")) + 1 > 1024:
+                raise MayaConnectionError("Bootstrap transfer command exceeds 1024 ASCII bytes")
+            return await self._send_receive(command)
+
+        def require(response: CommandResponse, expected: Any) -> None:
+            if response.error or response.result != expected:
+                raise MayaConnectionError(
+                    f"Unexpected acknowledgement: result={response.result!r}, "
+                    f"error={response.error!r}"
+                )
+
+        sources = {"bootstrap": get_bootstrap_code(), "helper": get_helper_module_code()}
+        decoded = {}
+        try:
+            initialize = (
+                f"(__import__('sys').modules.__setitem__({transfer_name!r}, "
+                f"__import__('types').ModuleType({transfer_name!r})), "
+                f"{transfer}.__dict__.update(bootstrap=[], helper=[]), '__MCP_TRANSFER_READY__')[2]"
+            )
+            require(await send(initialize), "__MCP_TRANSFER_READY__")
+
+            for label, source in sources.items():
+                encoded = base64.b64encode(zlib.compress(source.encode("utf-8"))).decode("ascii")
+                chunks = [encoded[index : index + 512] for index in range(0, len(encoded), 512)]
+                target = f"{transfer}.{label}"
+                for count, chunk in enumerate(chunks, start=1):
+                    stage = f"transfer {label} chunk {count}/{len(chunks)}"
+                    command = f"({target}.append({chunk!r}), len({target}))[1]"
+                    require(await send(command), count)
+
+                decoded[label] = (
+                    f"__import__('zlib').decompress(__import__('base64').b64decode(''.join({target})))"
+                )
+                stage = f"verify {label} checksum"
+                checksum_command = (
+                    f"'SHA256:' + __import__('hashlib').sha256({decoded[label]}).hexdigest()"
+                )
+                digest = "SHA256:" + hashlib.sha256(source.encode("utf-8")).hexdigest()
+                require(await send(checksum_command), digest)
+
+            # Refresh the global creator even when a legacy helper is present;
+            # its embedded creator predates hash reuse and teardown.
+            stage = "inject bootstrap creator"
+            bootstrap_command = (
+                f"exec({decoded['bootstrap']}.decode('utf-8'), globals()) "
+                "or '__MCP_BOOTSTRAP_READY__'"
+            )
+            require(await send(bootstrap_command), "__MCP_BOOTSTRAP_READY__")
+            stage = "install Maya helper"
+            result = await send(
+                f"create_module('maya_mcp', {decoded['helper']}.decode('utf-8'), True)"
+            )
+            if not isinstance(result.result, dict) or result.result.get("success") is not True:
+                raise MayaConnectionError(f"Helper installation did not succeed: {result!r}")
+            if result.result.get("warning"):
+                logger.warning("Maya helper upgrade warning: %s", result.result["warning"])
+            installed = True
+            logger.info(
+                "Maya session bootstrapped (helper reused=%s)", result.result.get("reused", False)
+            )
+        except Exception as exc:
+            raise MayaConnectionError(f"Maya bootstrap failed during {stage}: {exc}") from exc
+        finally:
+            cleanup = (
+                f"(__import__('sys').modules.pop({transfer_name!r}, None), "
+                "'__MCP_TRANSFER_CLEARED__')[1]"
+            )
+            try:
+                require(await send(cleanup), "__MCP_TRANSFER_CLEARED__")
+            except Exception as exc:
+                if installed:
+                    raise MayaConnectionError(
+                        f"Maya bootstrap transfer cleanup failed: {exc}"
+                    ) from exc
+                logger.warning("Could not clear Maya source transfer %s: %s", transfer_name, exc)
 
     async def bootstrap(self, client_type: Literal["native", "qt"] = "native") -> BaseMayaClient:
         """
@@ -502,9 +670,13 @@ class MayaClient(BaseMayaClient):
             # Therefore, the port returned by _send_receive might be different than requested.
             logger.info(f"Starting Qt server on port {new_port}")
             result = await self._send_receive(self.START_QT_SERVER, {"port": new_port})
-            # Extract the actual port from the response (may differ if server was already running)
-            if result.result and isinstance(result.result, dict):
-                new_port = result.result.get("port", new_port)
+            logger.info("Qt server start response: %r (requested port %s)", result, new_port)
+            # Never guess the requested port if startup did not acknowledge it.
+            if not isinstance(result.result, dict) or "port" not in result.result:
+                raise MayaConnectionError(f"Invalid Qt server start response: {result!r}")
+            new_port = result.result["port"]
+            if not isinstance(new_port, int) or not 1 <= new_port <= 65535:
+                raise MayaConnectionError(f"Invalid Qt server port: {new_port!r}")
             logger.info(f"Qt server started on port {new_port}")
 
             # Wait a moment for the port to start listening
@@ -600,7 +772,8 @@ class MayaClient(BaseMayaClient):
                 except Exception:
                     pass
                 logger.info(
-                    f"Disconnected from commandPort {old_port}, now using Qt server on port {qt_port}"
+                    f"Disconnected from commandPort {old_port}, "
+                    f"now using Qt server on port {qt_port}"
                 )
 
         except Exception as e:
@@ -645,6 +818,8 @@ class MayaClient(BaseMayaClient):
         Returns:
             True if Maya responds, False otherwise
         """
+        if self.is_busy:
+            return True
         try:
             response = await self._send_receive("1+1")
             return str(response.result if response.result is not None else "").strip() == "2"
@@ -656,7 +831,8 @@ class MayaQtClient(BaseMayaClient):
     """Async client for communicating with our custom Maya Qt Command Server."""
 
     GET_SESSION_INFO = "get_session_info"
-    EXECUTE_TEMPLATE = "execute"
+    EXECUTE_TEMPLATE = "execute_and_get_buffered"
+    ATOMIC_EXECUTION = True
     CREATE_MODULE_TEMPLATE = "create_module"
     INSTALL_STREAM_CAPTURE = "install_stream_capture"
     UNINSTALL_STREAM_CAPTURE = "uninstall_stream_capture"
@@ -668,28 +844,37 @@ class MayaQtClient(BaseMayaClient):
 
     async def connect(self) -> None:
         """Connect to the Qt server with retry logic."""
-        max_retries = 3
-        retry_delay = 0.5  # Start with 0.5 seconds
-
-        for attempt in range(max_retries):
-            try:
-                self._reader, self._writer = await asyncio.wait_for(
-                    asyncio.open_connection(self.host, self.port),
-                    timeout=self.timeout,
-                )
-                logger.info(f"Connected to Qt server at {self.host}:{self.port}")
+        async with self._connection_lock:
+            if self.is_connected:
+                self._awaiting_reconnect = False
                 return
-            except Exception as e:
-                if attempt < max_retries - 1:
-                    logger.warning(
-                        f"Failed to connect to Qt server (attempt {attempt + 1}/{max_retries}): {e}"
+            max_retries = 3
+            retry_delay = 0.5
+            for attempt in range(max_retries):
+                try:
+                    self._reader, self._writer = await asyncio.wait_for(
+                        asyncio.open_connection(self.host, self.port, limit=MAX_RESPONSE_BYTES),
+                        timeout=self.timeout,
                     )
-                    await asyncio.sleep(retry_delay)
-                    retry_delay *= 2  # Exponential backoff
-                else:
-                    raise MayaConnectionError(
-                        f"Failed to connect to Qt server after {max_retries} attempts: {e}"
-                    ) from e
+                    self._awaiting_reconnect = False
+                    logger.info(f"Connected to Qt server at {self.host}:{self.port}")
+                    return
+                except Exception as e:
+                    if attempt < max_retries - 1:
+                        logger.warning(
+                            "Failed to connect to Qt server (attempt %s/%s): %s",
+                            attempt + 1,
+                            max_retries,
+                            e,
+                        )
+                        await asyncio.sleep(retry_delay)
+                        retry_delay *= 2
+                    else:
+                        if isinstance(e, OSError):
+                            self._awaiting_reconnect = False
+                        raise MayaConnectionError(
+                            f"Failed to connect to Qt server after {max_retries} attempts: {e}"
+                        ) from e
 
     async def write_module(
         self,
@@ -720,22 +905,28 @@ class MayaQtClient(BaseMayaClient):
         return f"Module '{name}' created"
 
     async def _send_receive(
-        self, method: str, params: dict[str, Any] | None = None, raise_on_error: bool = True
+        self,
+        method: str,
+        params: dict[str, Any] | None = None,
+        raise_on_error: bool = True,
+        timeout: float | None = None,
     ) -> CommandResponse:
         """Send JSON request to Qt server and receive response.
 
         Args:
             method: Method name to call
             params: Parameters for the method
-            raise_on_error: If True, raise exception on error. If False, return full response with error.
+            raise_on_error: Raise on remote errors when True; otherwise return the full response.
 
         Returns:
             CommandResponse with result and error attributes
         """
-        if not self._writer or not self._reader:
-            raise MayaConnectionError("Not connected to Qt server")
+        effective_timeout = self._effective_timeout(timeout)
 
         async with self._lock:
+            if not self._writer or not self._reader:
+                raise MayaConnectionError("Not connected to Qt server")
+            reader, writer = self._reader, self._writer
             # Generate request ID
             self._request_counter += 1
             request_id = f"req-{self._request_counter}"
@@ -743,21 +934,31 @@ class MayaQtClient(BaseMayaClient):
             # Build request
             request = {"id": request_id, "method": method, "params": params or {}}
 
-            try:
-                # Send request
+            async def exchange() -> bytes:
                 request_line = json.dumps(request) + "\n"
-                self._writer.write(request_line.encode("utf-8"))
-                await self._writer.drain()
+                writer.write(request_line.encode("utf-8"))
+                await writer.drain()
+                return await reader.readline()
 
-                # Read response (line-delimited JSON)
-                response_line = await asyncio.wait_for(
-                    self._reader.readline(), timeout=self.timeout
-                )
-
-                if not response_line:
+            try:
+                response_line = await asyncio.wait_for(exchange(), timeout=effective_timeout)
+                if not response_line or not response_line.endswith(b"\n"):
                     raise MayaConnectionError("Connection closed by Qt server")
+                if len(response_line) > MAX_RESPONSE_BYTES:
+                    raise MayaExecutionError("Qt response exceeds 16 MiB limit")
 
                 response = json.loads(response_line.decode("utf-8"))
+                if not isinstance(response, dict):
+                    raise MayaExecutionError("Qt server response must be a JSON object")
+                if method == self.EXECUTE_TEMPLATE and not response.get("error"):
+                    if not all(
+                        key in response for key in ("result", "stdout", "stderr", "truncated")
+                    ):
+                        raise MayaExecutionError("Invalid atomic execution response from Maya")
+                    if not isinstance(response["stdout"], str) or not isinstance(
+                        response["stderr"], str
+                    ):
+                        raise MayaExecutionError("Maya execution output must be text")
 
                 # Validate response ID
                 if response.get("id") != request_id:
@@ -765,22 +966,39 @@ class MayaQtClient(BaseMayaClient):
                         f"Response ID mismatch: expected {request_id}, got {response.get('id')}"
                     )
 
-                # Check for error
-                if raise_on_error and response.get("error"):
-                    error = response["error"]
-                    raise MayaExecutionError(f"{error.get('message', 'Unknown error')}")
-
-                # Return CommandResponse
-                return CommandResponse(result=response.get("result"), error=response.get("error"))
-
+            except asyncio.CancelledError:
+                self._discard_connection(recoverable=True)
+                raise
             except asyncio.TimeoutError as e:
-                raise MayaExecutionError("Timeout waiting for Qt server response") from e
+                self._discard_connection(recoverable=True)
+                raise MayaExecutionError(
+                    "Timeout waiting for Qt server response; code may still be running"
+                ) from e
             except json.JSONDecodeError as e:
+                self._discard_connection()
                 raise MayaExecutionError(f"Invalid JSON response from Qt server: {e}") from e
+            except (ValueError, asyncio.LimitOverrunError) as e:
+                self._discard_connection()
+                raise MayaExecutionError("Qt response exceeds 16 MiB limit") from e
             except Exception as e:
+                self._discard_connection()
                 if not isinstance(e, (MayaConnectionError, MayaExecutionError)):
                     raise MayaExecutionError(f"Error communicating with Qt server: {e}") from e
                 raise
+
+            if raise_on_error and response.get("error"):
+                error = response["error"]
+                message = (
+                    error.get("message", "Unknown error") if isinstance(error, dict) else error
+                )
+                raise MayaExecutionError(str(message))
+            return CommandResponse(
+                result=response.get("result"),
+                error=response.get("error"),
+                stdout=response.get("stdout", ""),
+                stderr=response.get("stderr", ""),
+                truncated=bool(response.get("truncated", False)),
+            )
 
     async def ping(self) -> bool:
         """
@@ -789,6 +1007,8 @@ class MayaQtClient(BaseMayaClient):
         Returns:
             True if Maya responds, False otherwise
         """
+        if self.is_busy:
+            return True
         try:
             response = await self._send_receive("ping")
             return bool(response.result == "pong")

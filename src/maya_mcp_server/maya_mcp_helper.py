@@ -6,13 +6,14 @@ import ast
 import json
 import sys
 import traceback
+from types import CodeType
 from typing import Any
 
 
 # Try importing Qt from PySide2 (Maya 2022-2023) or PySide6 (Maya 2024+)
 try:
-    from PySide2.QtCore import QIODevice, QTimer  # type: ignore[import-not-found]
-    from PySide2.QtNetwork import (  # type: ignore[import-not-found]
+    from PySide2.QtCore import QIODevice, QTimer
+    from PySide2.QtNetwork import (
         QHostAddress,
         QTcpServer,
         QTcpSocket,
@@ -30,83 +31,80 @@ except ImportError:
         QIODevice = None
 
 CAPTURE_VARIABLE = "_mcp_result"
+MAX_OUTPUT_BYTES = 1_048_576
+MAX_REQUEST_BYTES = 8_388_608
+_execution_namespace: dict[str, Any] = {
+    "__builtins__": __builtins__,
+    "__name__": "__mcp_exec__",
+    "__doc__": None,
+}
 
 
 def prepare_code_for_result_capture(
     code: str, capture_variable: str = CAPTURE_VARIABLE
-) -> tuple[str, bool]:
+) -> tuple[CodeType, bool]:
     """
     Transform Python code to capture the result of the final expression.
 
     If the final statement is a standalone expression at the module level
     (not nested in a loop, function, or class, and not an assignment),
-    prepends `_mcp_result = ` to capture its value.
-
-    Args:
-        code: Python source code string
-
-    Returns:
-        A tuple of (transformed_code, was_transformed).
-        If no transformation was needed, returns (original_code, False).
+    returns a compiled module which assigns its value to ``capture_variable``.
+    Editing the AST keeps source locations and works on Maya 2022's Python
+    3.7 without ``ast.unparse``. Syntax errors propagate to the execution
+    envelope with the original line numbers.
     """
-    code = code.rstrip()
-
-    try:
-        tree = ast.parse(code)
-    except SyntaxError:
-        return code, False
-
-    if not tree.body:
-        return code, False
-
-    last_stmt = tree.body[-1]
-
-    # Only transform standalone expressions
-    # ast.Expr is a statement node that wraps an expression value
-    # This excludes: assignments, augmented assignments, annotated assignments,
-    # function/class definitions, control flow (if/for/while/try), imports, etc.
-    if not isinstance(last_stmt, ast.Expr):
-        return code, False
-
-    # Get the expression as a string using ast.unparse (Python 3.9+)
-    expr_str = ast.unparse(last_stmt.value)
-
-    # Build the new code: all statements except the last + new assignment
-    # We use ast.unparse for preceding statements to handle edge cases like
-    # semicolon-separated statements on the same line (e.g., "x = 1; 2")
-    preceding_stmts = tree.body[:-1]
-    if preceding_stmts:
-        before = "\n".join(ast.unparse(stmt) for stmt in preceding_stmts) + "\n"
-    else:
-        before = ""
-
-    new_stmt = f"{capture_variable} = {expr_str}\n"
-
-    return before + new_stmt, True
+    tree = ast.parse(code, filename="<mcp>")
+    last_stmt = tree.body[-1] if tree.body else None
+    transformed = isinstance(last_stmt, ast.Expr)
+    if isinstance(last_stmt, ast.Expr):
+        assignment = ast.Assign(
+            targets=[ast.Name(id=capture_variable, ctx=ast.Store())], value=last_stmt.value
+        )
+        tree.body[-1] = ast.copy_location(assignment, last_stmt)
+        ast.fix_missing_locations(tree)
+    return compile(tree, "<mcp>", "exec", dont_inherit=True), transformed
 
 
 class StreamWriter:
     """Custom writer that captures output for MCP Resource streaming."""
 
-    def __init__(self, stream_type: str, original: Any) -> None:
+    def __init__(self, stream_type: str, original: Any, max_bytes: int = MAX_OUTPUT_BYTES) -> None:
+        if max_bytes < 1:
+            raise ValueError("max_bytes must be positive")
         self.stream_type = stream_type
         self._wrapped = original
-        self._buffer: list[str] = []
+        self._max_bytes = max_bytes
+        self._buffer = bytearray()
+        self._truncated = False
 
-    def write(self, text: str) -> None:
+    def write(self, text: str) -> int:
+        if not isinstance(text, str):
+            raise TypeError("write() argument must be str")
         if text:
-            self._buffer.append(text)
+            encoded = text.encode("utf-8", errors="replace")
+            remaining = self._max_bytes - len(self._buffer)
+            self._buffer.extend(encoded[:remaining])
+            self._truncated = self._truncated or len(encoded) > remaining
         if self._wrapped:
             self._wrapped.write(text)
+        return len(text)
 
     def flush(self) -> None:
         if self._wrapped:
             self._wrapped.flush()
 
     def get_buffer(self) -> str:
-        result = "".join(self._buffer)
+        """Compatibility accessor; new callers use drain() for truncation metadata."""
+        return self.drain()[0]
+
+    def drain(self) -> tuple[str, bool]:
+        # A byte cap can split the final UTF-8 character. Drop that incomplete
+        # suffix rather than returning a replacement glyph or exceeding the cap.
+        result = self._buffer.decode("utf-8", errors="ignore")
+        truncated = self._truncated
         self._buffer.clear()
-        return result
+        self._truncated = False
+        return result, truncated
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._wrapped, name)
@@ -136,19 +134,25 @@ def uninstall_stream_capture() -> str:
     global _stderr_writer
 
     if _stdout_writer is not None:
-        sys.stdout = _stdout_writer._wrapped
+        if sys.stdout is _stdout_writer:
+            sys.stdout = _stdout_writer._wrapped
         _stdout_writer = None
     if _stderr_writer is not None:
-        sys.stderr = _stderr_writer._wrapped
+        if sys.stderr is _stderr_writer:
+            sys.stderr = _stderr_writer._wrapped
         _stderr_writer = None
     return json.dumps({"success": True})
 
 
+def _drain_output() -> dict[str, Any]:
+    stdout, out_truncated = _stdout_writer.drain() if _stdout_writer else ("", False)
+    stderr, err_truncated = _stderr_writer.drain() if _stderr_writer else ("", False)
+    return {"stdout": stdout, "stderr": stderr, "truncated": out_truncated or err_truncated}
+
+
 def get_buffered_output() -> str:
-    """Get buffered stdout/stderr and clear buffers."""
-    stdout = _stdout_writer.get_buffer() if _stdout_writer else ""
-    stderr = _stderr_writer.get_buffer() if _stderr_writer else ""
-    return json.dumps({"stdout": stdout, "stderr": stderr})
+    """Get buffered stdout/stderr and clear buffers, including truncation state."""
+    return json.dumps(_drain_output())
 
 
 def get_session_info() -> str:
@@ -171,33 +175,64 @@ def get_session_info() -> str:
     )
 
 
-def execute(code: str, result_type: str = "NONE") -> str:
-    """Execute code and return result as JSON."""
+def _exception_info(error: BaseException) -> dict[str, str]:
+    try:
+        message = str(error)
+    except Exception:
+        message = "<exception message could not be converted to text>"
+    return {
+        "type": f"{type(error).__module__}.{type(error).__name__}",
+        "message": message,
+        "traceback": "".join(traceback.format_exception(type(error), error, error.__traceback__)),
+    }
+
+
+def _execute_response(code: str, result_type: str = "NONE") -> dict[str, Any]:
+    """Execute exactly once; make every failure serializable on both transports."""
     result = None
     error = None
-    context = globals()
+    context = _execution_namespace
     try:
-        modified_code, was_modified = prepare_code_for_result_capture(code)
-        if result_type != "NONE" and was_modified is False:
-            raise RuntimeError(
-                "Results were requested but the code cannot be modified to capture a result."
-                "If you want to capture a result, make sure that the last line of code is in "
-                "the module scope (i.e. not in a function or loop"
-            )
+        if result_type not in ("NONE", "RAW", "JSON"):
+            raise ValueError("result_type must be NONE, RAW, or JSON")
+        if result_type == "NONE":
+            compiled = compile(code, "<mcp>", "exec", dont_inherit=True)
+        else:
+            compiled, was_modified = prepare_code_for_result_capture(code)
+            if not was_modified:
+                raise RuntimeError("A captured result requires a final expression at module scope.")
+        exec(compiled, context)
+        if result_type != "NONE":
+            value = context.pop(CAPTURE_VARIABLE)
+            # JSON stays double-encoded for the existing host-side decoder.
+            # RAW supports arbitrary Maya objects through their string form.
+            result = json.dumps(value) if result_type == "JSON" else str(value)
 
-        exec(compile(modified_code, "<mcp>", "exec"), context)
-        if was_modified:
-            result = context[CAPTURE_VARIABLE]
-            if result_type == "JSON":
-                result = json.dumps(result)
+    except BaseException as e:
+        # SystemExit/KeyboardInterrupt must complete the RPC as errors too;
+        # leaving it unanswered would hide cancellation behind a timeout.
+        result = None
+        error = _exception_info(e)
+    return {"result": result, "error": error}
 
-    except Exception as e:
-        error = {
-            "type": f"{type(e).__module__}.{type(e).__name__}",
-            "message": str(e),
-            "traceback": traceback.format_exc(),
-        }
-    return json.dumps({"result": result, "error": error})
+
+def execute(code: str, result_type: str = "NONE") -> str:
+    """Legacy result/error envelope; NONE always returns a null result."""
+    return json.dumps(_execute_response(code, result_type))
+
+
+def execute_and_get_buffered(code: str, result_type: str = "NONE") -> str:
+    """Execute and collect its output in one main-thread RPC.
+
+    Drain earlier interactive output before executing so prior activity cannot
+    be mistaken for the current request's output. Qt dispatch serializes this
+    entire operation, including when the payload calls processEvents().
+    """
+    install_stream_capture()
+    _drain_output()
+    response = _execute_response(code, result_type)
+    response.update(_drain_output())
+    return json.dumps(response)
 
 
 def start_command_port(port: int) -> str:
@@ -225,6 +260,7 @@ class QtCommandServer:
         self._process_timer = QTimer()
         self._port = port
         self._running = False
+        self._processing = False
         self._next_client_id = 0
 
         # Connect signals
@@ -233,6 +269,8 @@ class QtCommandServer:
 
     def start(self) -> None:
         """Start listening on OS-assigned port."""
+        if self._running:
+            return
         # Listen on loopback with OS-assigned port (port 0)
         if not self._server.listen(QHostAddress.LocalHost, self._port):
             raise RuntimeError(f"Failed to start server: {self._server.errorString()}")
@@ -247,15 +285,29 @@ class QtCommandServer:
     def stop(self) -> None:
         """Stop the server and close connections."""
         self._running = False
-        self._process_timer.stop()
-
-        # Disconnect all clients
-        for client_id in list(self._clients.keys()):
-            client_info = self._clients[client_id]
-            client_info["socket"].disconnectFromHost()
-
-        self._clients.clear()
-        self._server.close()
+        # Disconnect callbacks before releasing objects: deleteLater() from a
+        # prior teardown can otherwise fire into an obsolete module instance.
+        for obj, signal_name, slot in (
+            (self._process_timer, "timeout", self._process_messages),
+            (self._server, "newConnection", self._on_new_connection),
+        ):
+            try:
+                getattr(obj, signal_name).disconnect(slot)
+            except (RuntimeError, TypeError):
+                pass
+        try:
+            self._process_timer.stop()
+        except RuntimeError:
+            pass
+        for client_id in list(self._clients):
+            self._remove_client(client_id)
+        for obj in (self._process_timer, self._server):
+            try:
+                if obj is self._server:
+                    obj.close()
+                obj.deleteLater()
+            except RuntimeError:
+                pass
 
     @property
     def port(self) -> int:
@@ -264,14 +316,18 @@ class QtCommandServer:
 
     def _on_new_connection(self) -> None:
         """Handle new client connection."""
+        if not self._running:
+            return
         socket = self._server.nextPendingConnection()
+        if socket is None:
+            return
 
         # Assign unique client ID
         client_id = self._next_client_id
         self._next_client_id += 1
 
         # Store client info
-        self._clients[client_id] = {"socket": socket, "input_buffer": "", "output_queue": []}
+        self._clients[client_id] = {"socket": socket, "input_buffer": b"", "output_queue": []}
 
         # Connect signals with client_id
         socket.readyRead.connect(lambda cid=client_id: self._on_ready_read(cid))
@@ -284,47 +340,69 @@ class QtCommandServer:
 
     def _on_disconnected(self, client_id: int) -> None:
         """Handle client disconnect."""
-        if client_id in self._clients:
-            del self._clients[client_id]
+        self._remove_client(client_id)
+
+    def _remove_client(self, client_id: int) -> None:
+        client_info = self._clients.pop(client_id, None)
+        if client_info is None:
+            return
+        socket = client_info["socket"]
+        for signal_name in ("readyRead", "disconnected"):
+            try:
+                getattr(socket, signal_name).disconnect()
+            except (RuntimeError, TypeError):
+                pass
+        # Peer shutdown may have deleted the C++ socket before Python notices.
+        for action in ("disconnectFromHost", "close", "deleteLater"):
+            try:
+                getattr(socket, action)()
+            except RuntimeError:
+                pass
 
     def _process_messages(self) -> None:
         """Process incoming/outgoing messages (called by timer)."""
-        # Cleanup stale clients (disconnected sockets)
-        stale_clients = []
-        for client_id, client_info in self._clients.items():
-            socket = client_info["socket"]
-            if not socket.isValid() or socket.state() != QTcpSocket.ConnectedState:
-                stale_clients.append(client_id)
+        # A payload may pump the Qt event loop. Never let the timer execute a
+        # second request inside its first request's stdout/error transaction.
+        if not self._running or self._processing:
+            return
+        self._processing = True
+        try:
+            for client_id, client_info in list(self._clients.items()):
+                if client_id not in self._clients:
+                    continue
+                socket = client_info["socket"]
+                try:
+                    if not socket.isValid() or socket.state() != QTcpSocket.ConnectedState:
+                        self._remove_client(client_id)
+                        continue
+                    if socket.bytesAvailable() > 0:
+                        # Keep undecoded bytes until the complete JSON line has
+                        # arrived; TCP can split any multibyte UTF-8 character.
+                        incoming = bytes(socket.readAll())
+                        input_buffer = client_info["input_buffer"] + incoming
+                        if len(input_buffer) > MAX_REQUEST_BYTES:
+                            self._remove_client(client_id)
+                            continue
+                        while b"\n" in input_buffer:
+                            line, input_buffer = input_buffer.split(b"\n", 1)
+                            client_info["input_buffer"] = input_buffer
+                            if line.strip():
+                                self._handle_message(client_id, line.strip())
+                            if client_id not in self._clients or not self._running:
+                                break
+                        client_info["input_buffer"] = input_buffer
+                    if client_id in self._clients and self._running:
+                        output_queue = client_info["output_queue"]
+                        if output_queue:
+                            message = output_queue.pop(0)
+                            socket.write((message + "\n").encode("utf-8"))
+                            socket.flush()
+                except RuntimeError:
+                    self._remove_client(client_id)
+        finally:
+            self._processing = False
 
-        for client_id in stale_clients:
-            del self._clients[client_id]
-
-        # Process each client
-        for client_id, client_info in list(self._clients.items()):
-            socket = client_info["socket"]
-            input_buffer = client_info["input_buffer"]
-            output_queue = client_info["output_queue"]
-
-            # Process incoming messages
-            if socket.bytesAvailable() > 0:
-                data = bytes(socket.readAll()).decode("utf-8")
-                input_buffer += data
-                client_info["input_buffer"] = input_buffer
-
-                # Process complete lines
-                while "\n" in input_buffer:
-                    line, input_buffer = input_buffer.split("\n", 1)
-                    client_info["input_buffer"] = input_buffer
-                    if line.strip():
-                        self._handle_message(client_id, line.strip())
-
-            # Process outgoing messages
-            if output_queue:
-                message = output_queue.pop(0)
-                socket.write((message + "\n").encode("utf-8"))
-                socket.flush()
-
-    def _handle_message(self, client_id: int, line: str) -> None:
+    def _handle_message(self, client_id: int, line: bytes | str) -> None:
         """Handle a complete JSON message."""
         if client_id not in self._clients:
             return
@@ -333,18 +411,18 @@ class QtCommandServer:
         request: Any = None
 
         try:
+            if isinstance(line, bytes):
+                line = line.decode("utf-8")
             request = json.loads(line)
+            if not isinstance(request, dict):
+                raise ValueError("Request must be a JSON object")
             response = self._dispatch_request(request)
             output_queue.append(json.dumps(response))
         except Exception as e:
             error_response = {
                 "id": request.get("id") if isinstance(request, dict) else None,
                 "result": None,
-                "error": {
-                    "type": f"{type(e).__module__}.{type(e).__name__}",
-                    "message": str(e),
-                    "traceback": traceback.format_exc(),
-                },
+                "error": _exception_info(e),
             }
             output_queue.append(json.dumps(error_response))
 
@@ -364,6 +442,14 @@ class QtCommandServer:
                     "result": result_obj.get("result"),
                     "error": result_obj.get("error"),
                 }
+
+            elif method == "execute_and_get_buffered":
+                result_str = execute_and_get_buffered(
+                    params.get("code", ""), params.get("result_type", "NONE")
+                )
+                response: dict[str, Any] = json.loads(result_str)
+                response["id"] = req_id
+                return response
 
             elif method == "get_session_info":
                 result_str = get_session_info()
@@ -411,11 +497,7 @@ class QtCommandServer:
             return {
                 "id": req_id,
                 "result": None,
-                "error": {
-                    "type": f"{type(e).__module__}.{type(e).__name__}",
-                    "message": str(e),
-                    "traceback": traceback.format_exc(),
-                },
+                "error": _exception_info(e),
             }
 
 
@@ -427,32 +509,48 @@ def start_qt_server(port: int) -> str:
     """Start the Qt command server and return the port number."""
     global _qt_server
 
-    if _qt_server is not None:
+    if _qt_server is not None and _qt_server._running:
         return json.dumps({"port": _qt_server.port, "already_running": True})
 
+    new_server = None
     try:
-        _qt_server = QtCommandServer(port)
-        _qt_server.start()
+        new_server = QtCommandServer(port)
+        new_server.start()
+        _qt_server = new_server
         return json.dumps({"port": _qt_server.port, "already_running": False})
     except Exception as e:
-        return json.dumps(
-            {
-                "error": {
-                    "type": f"{type(e).__module__}.{type(e).__name__}",
-                    "message": str(e),
-                    "traceback": traceback.format_exc(),
-                }
-            }
-        )
+        if new_server is not None:
+            new_server.stop()
+        _qt_server = None
+        return json.dumps({"error": _exception_info(e)})
 
 
 def stop_qt_server() -> str:
     """Stop the Qt command server."""
     global _qt_server
-    if _qt_server:
-        _qt_server.stop()
-        _qt_server = None
+    old_server = _qt_server
+    _qt_server = None
+    if old_server is not None:
+        old_server.stop()
     return json.dumps({"success": True})
+
+
+def teardown() -> str:
+    """Release helper-owned Qt and stream objects before module replacement.
+
+    User variables live in _execution_namespace and deliberately survive this
+    cleanup. create_module can transfer that dictionary to the replacement.
+    """
+    try:
+        stop_qt_server()
+    finally:
+        uninstall_stream_capture()
+    return json.dumps({"success": True})
+
+
+def _mcp_teardown() -> str:
+    """Reload hook recognized by both bootstrap implementations."""
+    return teardown()
 
 
 def get_qt_server_port() -> str:
