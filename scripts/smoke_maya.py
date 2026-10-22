@@ -146,6 +146,7 @@ async def run_version(
         result["manifest"] = manifest
         env = dict(
             os.environ,
+            MAYA_MCP_DIAGNOSTICS="1",
             MAYA_MCP_ALLOW_PORTS="0",
             PYTHONUTF8="1",
             PYTHONIOENCODING="utf-8",
@@ -337,6 +338,8 @@ async def run_version(
                         assert syntax["error"]["type"].endswith("SyntaxError")
                         serial = await execute("{1,2,3}", error=True)
                         assert serial["error"]["type"].endswith("TypeError")
+                        nonfinite = await execute("float('nan')", error=True)
+                        assert nonfinite["error"]["type"].endswith("ValueError")
                         assert (await execute("2+2"))["result"] == 4
 
                     await check("stdout/stderr and exception recovery", outputs)

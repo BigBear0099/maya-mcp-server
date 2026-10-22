@@ -206,7 +206,7 @@ def _execute_response(code: str, result_type: str = "NONE") -> dict[str, Any]:
             value = context.pop(CAPTURE_VARIABLE)
             # JSON stays double-encoded for the existing host-side decoder.
             # RAW supports arbitrary Maya objects through their string form.
-            result = json.dumps(value) if result_type == "JSON" else str(value)
+            result = json.dumps(value, allow_nan=False) if result_type == "JSON" else str(value)
 
     except BaseException as e:
         # SystemExit/KeyboardInterrupt must complete the RPC as errors too;
