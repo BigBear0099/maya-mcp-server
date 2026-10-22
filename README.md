@@ -48,6 +48,9 @@ and plugin ports `4434,4648,4658` remain excluded. Only pass known Python comman
 ports to `add_session`. Qt is the supported production transport; native commandPort
 is retained as a compatibility path with less reliable cross-client output capture.
 
+For the verified baseline, maintenance boundaries and future validation workflow,
+read [Maintenance handoff](Docs/MAINTENANCE.md).
+
 Validation commands:
 
 ```sh
